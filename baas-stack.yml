@@ -1,0 +1,212 @@
+version: "3.8"
+
+networks:
+  baas_network:
+    external: true
+  traefik_public:
+    external: true
+
+secrets:
+  db_password:
+    external: true
+  jwt_secret:
+    external: true
+    name: jwt_secret_v2
+  basic-auth-user:
+    external: true
+  basic-auth-password:
+    external: true
+
+services:
+  # 1. TRAEFIK (v3.3+/Latest for Docker 29 Compat)
+  traefik:
+    image: traefik:latest
+    environment:
+      DOCKER_API_VERSION: "1.45"
+    command:
+      - "--log.level=INFO"
+      - "--api.insecure=true"
+      - "--providers.swarm=true"
+      - "--providers.swarm.exposedByDefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - traefik_public
+      - baas_network
+    deploy:
+      placement:
+        constraints: [node.role == manager]
+
+  # 2. DATABASE
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: app_db
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_connections=500"]
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    secrets:
+      - db_password
+    networks:
+      - baas_network
+    deploy:
+      replicas: 1
+
+  # 3. AUTH (Keycloak)
+  auth:
+    image: quay.io/keycloak/keycloak:23.0
+    command: start-dev --proxy=edge
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://db:5432/app_db
+      KC_DB_USERNAME: postgres
+      KC_DB_PASSWORD_FILE: /run/secrets/db_password
+      KC_HOSTNAME_STRICT: "false"
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    secrets:
+      - db_password
+    networks:
+      - baas_network
+    deploy:
+      replicas: 1
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.services.auth.loadbalancer.server.port=8080"
+        - "traefik.http.routers.auth.rule=Host(`auth.dots.net.tr`)"
+        - "traefik.http.routers.auth.entrypoints=web"
+        - "traefik.http.routers.auth-secure.rule=Host(`auth.dots.net.tr`)"
+        - "traefik.http.routers.auth-secure.entrypoints=websecure"
+        - "traefik.http.routers.auth-secure.tls=true"
+        - "traefik.http.routers.auth-secure.service=auth"
+
+  # 4. REALTIME
+  realtime:
+    image: local/custom-realtime:latest
+    environment:
+      PORT: 4000
+      DATABASE_URL: "postgresql://postgres:Sifre2026Istanbul@db:5432/app_db"
+    networks:
+      - baas_network
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.services.realtime.loadbalancer.server.port=4000"
+        - "traefik.http.services.realtime.loadbalancer.sticky.cookie=true"
+        - "traefik.http.routers.realtime.rule=Host(`realtime.dots.net.tr`)"
+        - "traefik.http.routers.realtime.entrypoints=web"
+        - "traefik.http.routers.realtime-secure.rule=Host(`realtime.dots.net.tr`)"
+        - "traefik.http.routers.realtime-secure.entrypoints=websecure"
+        - "traefik.http.routers.realtime-secure.tls=true"
+        - "traefik.http.routers.realtime-secure.service=realtime"
+
+  # 5. API (PostgREST)
+  api:
+    image: postgrest/postgrest:latest
+    environment:
+      PGRST_DB_URI: "postgres://postgres:Sifre2026Istanbul@db:5432/app_db"
+      PGRST_DB_SCHEMA: "public"
+      PGRST_DB_ANON_ROLE: "anon"
+      # FORCE JWT SECRET VIA ENV VAR (bypass secret mount issues)
+      PGRST_JWT_SECRET: "my-super-secret-jwt-token-at-least-32-chars-long"
+    secrets:
+      - jwt_secret
+    networks:
+      - baas_network
+    deploy:
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.services.api.loadbalancer.server.port=3000"
+        - "traefik.http.routers.api.rule=Host(`api.dots.net.tr`)"
+        - "traefik.http.routers.api.entrypoints=web"
+        - "traefik.http.routers.api-secure.rule=Host(`api.dots.net.tr`)"
+        - "traefik.http.routers.api-secure.entrypoints=websecure"
+        - "traefik.http.routers.api-secure.tls=true"
+        - "traefik.http.routers.api-secure.service=api"
+
+  # 6. FUNCTIONS
+  gateway:
+    image: ghcr.io/openfaas/gateway:latest
+    environment:
+      functions_provider_url: "http://faas-swarm:8080/"
+      direct_functions: "true"    
+      upstream_timeout: "60s"
+      basic_auth: "true"
+      secret_mount_path: "/run/secrets/"
+    secrets:
+      - basic-auth-user
+      - basic-auth-password
+    networks:
+      - baas_network
+    deploy:
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.services.gateway.loadbalancer.server.port=8080"
+        - "traefik.http.routers.gateway.rule=Host(`functions.dots.net.tr`)"
+        - "traefik.http.routers.gateway.entrypoints=web"
+        - "traefik.http.routers.gateway-secure.rule=Host(`functions.dots.net.tr`)"
+        - "traefik.http.routers.gateway-secure.entrypoints=websecure"
+        - "traefik.http.routers.gateway-secure.tls=true"
+        - "traefik.http.routers.gateway-secure.service=gateway"
+
+  faas-swarm:
+    image: local/faas-swarm:latest
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    environment:
+      read_timeout: "60s"
+      write_timeout: "60s"
+      DOCKER_API_VERSION: "1.44"
+    secrets:
+      - basic-auth-user
+      - basic-auth-password
+    networks:
+      - baas_network
+    deploy:
+      placement:
+        constraints: [node.role == manager]
+
+  # 7. STORAGE (Supabase Storage API)
+  storage:
+    image: supabase/storage-api:v1.11.13
+    environment:
+      ANON_KEY: "my-super-secret-jwt-token-at-least-32-chars-long" # Using same secret for simplicity/demo
+      SERVICE_KEY: "my-super-secret-jwt-token-at-least-32-chars-long"
+      POSTGREST_URL: "http://api:3000"
+      PGRST_JWT_SECRET: "my-super-secret-jwt-token-at-least-32-chars-long"
+      DATABASE_URL: "postgres://postgres:Sifre2026Istanbul@db:5432/app_db"
+      FILE_SIZE_LIMIT: "52428800" # 50MB
+      STORAGE_BACKEND: "s3"
+      GLOBAL_S3_BUCKET: "dotsbaas"
+      REGION: "eu-central-2"
+      S3_ENDPOINT: "https://s3.eu-central-2.wasabisys.com"
+      ACCESS_KEY_ID: "7QEWAGU4T829KPN7PXV5"
+      SECRET_ACCESS_KEY: "7pygiyHL0LdeDjWdIVdwGjUVRzSuFS1zgYU80FsG"
+      TENANT_ID: "stub"
+    networks:
+      - baas_network
+    deploy:
+      replicas: 1
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.services.storage.loadbalancer.server.port=5000"
+        - "traefik.http.routers.storage.rule=Host(`storage.dots.net.tr`)"
+        - "traefik.http.routers.storage.entrypoints=web"
+        - "traefik.http.routers.storage-secure.rule=Host(`storage.dots.net.tr`)"
+        - "traefik.http.routers.storage-secure.entrypoints=websecure"
+        - "traefik.http.routers.storage-secure.tls=true"
+        - "traefik.http.routers.storage-secure.service=storage"
+
+volumes:
+  db_data:
