@@ -1,0 +1,16 @@
+name: example
+description: A simple example demonstrating how to use the dots_baas_flutter package.
+publish_to: 'none'
+version: 1.0.0
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  dots_baas_flutter:
+    path: ../
+
+flutter:
+  uses-material-design: true

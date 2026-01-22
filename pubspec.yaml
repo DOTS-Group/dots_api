@@ -1,6 +1,6 @@
 name: dots_baas_flutter
 description: The official Flutter client for Dots BaaS Platform. Provides Authentication, Database, and Realtime capabilities.
-version: 1.0.0
+version: 1.0.1
 homepage: https://dots.net.tr
 repository: https://github.com/dots-platform/dots_baas_flutter
 environment:
